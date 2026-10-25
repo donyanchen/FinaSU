@@ -327,21 +327,18 @@ static void initialize_fake_status(void)
 
     struct selinux_kernel_status *new_status = page_address(new_page);
     memcpy(new_status, status, sizeof(*status));
-    if (ksu_late_loaded) {
-        // In late_load mode the loader may have reloaded sepolicy before us,
-        // so the captured page is not stock. Serve what a stock boot ends
-        // with instead: creation sentinel below 6.10, one load plus one
-        // setenforce above.
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
-        new_status->sequence = 4;
-        new_status->policyload = 1;
-#else
-        new_status->sequence = 0;
-        new_status->policyload = 0;
-#endif
-        if (!new_status->enforcing) {
-            new_status->enforcing = 1;
-        }
+    if (ksu_late_loaded && !new_status->enforcing) {
+        /*
+         * sequence / policyload keep the real captured values.
+         *
+         * They are NOT synthetic: sequence counts every policy load since
+         * boot, and policyload was dropped in 6.10 (always 0). HyperOS
+         * reloads sepolicy several times during boot, so the real sequence
+         * is device- and boot-dependent (observed: 12). Hardcoding any
+         * constant produces a value no stock kernel can report, which is
+         * exactly the fingerprint the detector matches on.
+         */
+        new_status->enforcing = 1;
     }
 
     fake_status = new_page;
@@ -485,13 +482,19 @@ static int selinux_hide_feature_set(u64 value)
     int ret = 0;
     pr_info("selinux_hide: set to %d\n", enable);
     mutex_lock(&selinux_hide_mutex);
-    ksu_selinux_hide_enabled = enable;
     if (enable) {
         if (!ksu_selinux_hide_running) {
             ret = ksu_selinux_hide_enable();
-            if (!ret) {
-                ksu_selinux_hide_running = true;
+            if (ret) {
+                /*
+                 * Do not record intent for a hook set we failed to install:
+                 * reporting the feature as enabled while the hooks are absent
+                 * makes the state look healthy from userspace.
+                 */
+                mutex_unlock(&selinux_hide_mutex);
+                return ret;
             }
+            ksu_selinux_hide_running = true;
         }
     } else {
         if (ksu_selinux_hide_running) {
@@ -499,6 +502,7 @@ static int selinux_hide_feature_set(u64 value)
             ksu_selinux_hide_running = false;
         }
     }
+    ksu_selinux_hide_enabled = enable;
     mutex_unlock(&selinux_hide_mutex);
     return ret;
 }
@@ -585,8 +589,19 @@ void __exit ksu_selinux_hide_exit()
 void ksu_selinux_hide_drop_backup_if_unused()
 {
     mutex_lock(&selinux_hide_mutex);
-    if (!ksu_selinux_hide_running && backup_sepolicy) {
-        pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
+    /*
+     * Gate on the configured intent (ksu_selinux_hide_enabled), not on
+     * whether the hooks are currently installed (ksu_selinux_hide_running).
+     *
+     * At boot_completed the hooks are never installed yet - they are only
+     * applied when userspace flips the feature on - so the running flag is
+     * always false here. Testing it dropped the backup of a feature the user
+     * had explicitly enabled, and since the clean policy snapshot can only
+     * be captured during the boot policy load, toggling the feature off and
+     * back on afterwards failed with -EAGAIN until the next reboot.
+     */
+    if (!ksu_selinux_hide_enabled && backup_sepolicy) {
+        pr_info("selinux_hide: not configured, drop backup_sepolicy\n");
         sidtab_destroy(backup_sepolicy->sidtab);
         kfree(backup_sepolicy->sidtab);
         ksu_destroy_sepolicy(backup_sepolicy);
